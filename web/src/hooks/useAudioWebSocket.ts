@@ -1,6 +1,13 @@
 import { useRef, useState, useCallback, useEffect } from "react";
 import { WS_URL } from "@/services/api";
 import type { WsControlMessage, TranscriptTurn, InterviewState, InterviewSpeaker } from "@/types";
+import {
+  enqueueAudioChunk,
+  getQueuedAudioChunks,
+  deleteAudioChunk,
+  clearAudioChunks,
+  type QueuedAudioChunk,
+} from "@/lib/audioChunkQueue";
 
 interface UseAudioWebSocketOptions {
   sessionId: number;
@@ -27,9 +34,29 @@ export function useAudioWebSocket({
   const reconnectAttemptsRef = useRef(0);
   const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionEndedRef = useRef(false);
+  const sequenceRef = useRef(0);
+  const flushingRef = useRef(false);
   const [connectionState, setConnectionState] = useState<
     "disconnected" | "connecting" | "connected"
   >("disconnected");
+
+  const flushQueuedChunks = useCallback(async () => {
+    if (flushingRef.current) return;
+    flushingRef.current = true;
+    try {
+      let chunks: QueuedAudioChunk[] = await getQueuedAudioChunks(sessionId);
+      while (chunks.length > 0) {
+        for (const chunk of chunks) {
+          if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+          wsRef.current.send(chunk.data);
+          await deleteAudioChunk(chunk.id);
+        }
+        chunks = await getQueuedAudioChunks(sessionId);
+      }
+    } finally {
+      flushingRef.current = false;
+    }
+  }, [sessionId]);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -45,6 +72,7 @@ export function useAudioWebSocket({
       setConnectionState("connected");
       reconnectAttemptsRef.current = 0;
       if (token) ws.send(JSON.stringify({ type: "auth", token }));
+      flushQueuedChunks();
     };
 
     // Only signal AI speaking once per turn (first binary chunk).
@@ -102,12 +130,14 @@ export function useAudioWebSocket({
               sessionEndedRef.current = true;
               reconnectAttemptsRef.current = RECONNECT_DELAYS.length; // suppress reconnect
               onStateChange("complete");
+              clearAudioChunks(sessionId);
               break;
             case "error":
               if (!msg.recoverable) {
                 sessionEndedRef.current = true;
                 reconnectAttemptsRef.current = RECONNECT_DELAYS.length;
                 onStateChange("complete");
+                clearAudioChunks(sessionId);
               }
               break;
           }
@@ -135,13 +165,28 @@ export function useAudioWebSocket({
         onStateChange("complete");
       }
     };
-  }, [sessionId, token, onAudioChunk, onTranscript, onStateChange, onSpeakerChange]);
+  }, [sessionId, token, onAudioChunk, onTranscript, onStateChange, onSpeakerChange, flushQueuedChunks]);
 
-  const send = useCallback((buffer: ArrayBuffer) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(buffer);
-    }
-  }, []);
+  const send = useCallback(
+    (buffer: ArrayBuffer) => {
+      if (wsRef.current?.readyState === WebSocket.OPEN && !flushingRef.current) {
+        wsRef.current.send(buffer);
+        return;
+      }
+      sequenceRef.current += 1;
+      enqueueAudioChunk({
+        sessionId,
+        sequence: sequenceRef.current,
+        timestamp: Date.now(),
+        data: buffer,
+      }).then(() => {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          flushQueuedChunks();
+        }
+      });
+    },
+    [sessionId, flushQueuedChunks],
+  );
 
   const sendJson = useCallback((payload: object) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -153,7 +198,8 @@ export function useAudioWebSocket({
     if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
     reconnectAttemptsRef.current = RECONNECT_DELAYS.length; // prevent reconnect
     wsRef.current?.close();
-  }, []);
+    clearAudioChunks(sessionId);
+  }, [sessionId]);
 
   useEffect(() => {
     return () => {
