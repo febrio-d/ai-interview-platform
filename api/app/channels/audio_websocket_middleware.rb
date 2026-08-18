@@ -135,6 +135,9 @@ class AudioWebSocketMiddleware
     state.browser_disconnected_at = Time.current
     state.proactive_reconnect_timer&.cancel
 
+    redis_sub = state.coverage_redis_sub
+    Thread.new { redis_sub&.unsubscribe }.tap { |t| t.report_on_exception = false } if redis_sub
+
     # Keep Gemini alive during grace period in case candidate reconnects via page refresh.
     schedule_graceful_end(browser_ws, state)
   end
@@ -160,8 +163,50 @@ class AudioWebSocketMiddleware
     state.cached_coverage_text = injector.injection_text
     state.last_coverage_digest = injector.coverage_fingerprint
 
+    subscribe_to_coverage_analysis(session, state)
+
     build_gemini_client(browser_ws, state)
     state.gemini_client.connect(resumption_handle: session.gemini_resumption_token.presence)
+  end
+
+  def subscribe_to_coverage_analysis(session, state)
+    channel = "coverage:#{session.id}"
+    redis = Redis.new(url: ENV.fetch('REDIS_URL', 'redis://localhost:6379/1'))
+    state.coverage_redis_sub = redis
+
+    Thread.new do
+      redis.subscribe(channel) do |on|
+        on.message do |_channel, message|
+          handle_coverage_analysis_message(message, session, state)
+        end
+      end
+    rescue StandardError => e
+      Rails.logger.error("[AudioWS] Coverage subscription error for #{channel}: #{e.message}")
+    ensure
+      redis.disconnect!
+    end
+  end
+
+  def handle_coverage_analysis_message(message, session, state)
+    payload = JSON.parse(message)
+    return unless payload['type'] == 'coverage_update'
+
+    analyzed_turn = payload['analyzed_turn'].to_i
+    return if analyzed_turn <= (state.last_analyzed_turn || 0)
+
+    state.last_analyzed_turn = analyzed_turn
+
+    EM.schedule do
+      Thread.new do
+        ActiveRecord::Base.connection_pool.with_connection do
+          refresh_coverage_cache(session, state)
+        end
+      rescue StandardError => e
+        Rails.logger.error("[AudioWS] Thread crashed (coverage refresh): #{e.class}: #{e.message}")
+      end
+    end
+  rescue JSON::ParserError
+    nil
   end
 
   def ensure_system_prompt(session)
@@ -225,17 +270,7 @@ class AudioWebSocketMiddleware
 
       # Bail immediately if the browser already dropped — avoids racing writes
       # for a turn nobody is listening for anymore.
-      unless state.browser_disconnected_at.present?
-        TranscriptTurnWriterWorker.perform_async(session.id, turn_number, 'candidate', text)
-
-        Thread.new do
-          ActiveRecord::Base.connection_pool.with_connection do
-            refresh_coverage_cache(session, state)
-          end
-        rescue StandardError => e
-          Rails.logger.error("[AudioWS] Thread crashed (coverage refresh): #{e.class}: #{e.message}")
-        end
-      end
+      TranscriptTurnWriterWorker.perform_async(session.id, turn_number, 'candidate', text) unless state.browser_disconnected_at.present?
 
       send_json(browser_ws, type: 'transcription', speaker: 'candidate',
                             text: text, turn_number: turn_number)
@@ -820,7 +855,8 @@ class AudioWebSocketMiddleware
                   :graceful_end_timer, :time_ceiling_timer,
                   :coverage_end_timer, :coverage_pending,
                   :last_ai_turn_ends_with_question, :wrap_up_injected,
-                  :waiting_for_candidate_response
+                  :waiting_for_candidate_response,
+                  :coverage_redis_sub, :last_analyzed_turn
 
     def initialize
       @turn_counter = 0
@@ -831,6 +867,7 @@ class AudioWebSocketMiddleware
       @last_ai_turn_ends_with_question = false
       @waiting_for_candidate_response = false
       @sent_time_warnings = Set.new
+      @last_analyzed_turn = 0
     end
 
     def increment_turn!
