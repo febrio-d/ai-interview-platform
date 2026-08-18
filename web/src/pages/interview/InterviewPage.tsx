@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams } from "react-router-dom";
+import type { AxiosError } from "axios";
 import { Button } from "@/components/ui/button";
 import {
   AlertDialog,
@@ -21,6 +22,7 @@ import { useAudioPlayback } from "@/hooks/useAudioPlayback";
 import { useAudioWebSocket } from "@/hooks/useAudioWebSocket";
 import { sessionsApi } from "@/services/sessions";
 import HardwareCheck from "@/components/HardwareCheck";
+import InterviewAborted, { type AbortedReason } from "@/components/interview/InterviewAborted";
 import { CheckCircle, Mic, MicOff } from "lucide-react";
 import type { CandidateInfo, InterviewState, InterviewSpeaker, TranscriptTurn } from "@/types";
 
@@ -30,6 +32,7 @@ export default function InterviewPage() {
   const [sessionId, setSessionId] = useState<number | null>(null);
   const [interviewState, setInterviewState] = useState<InterviewState>("idle");
   const interviewStateRef = useRef<InterviewState>("idle");
+  const fatalErrorRef = useRef(false);
   const [speaker, setSpeaker] = useState<InterviewSpeaker>(null);
   const [transcript, setTranscript] = useState<Pick<TranscriptTurn, "speaker" | "text">[]>([]);
   const [hardwareCheckDone, setHardwareCheckDone] = useState(false); // kept for green banner
@@ -39,10 +42,14 @@ export default function InterviewPage() {
   const connectionLostTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [micMuted, setMicMuted] = useState(false);
   const micMutedRef = useRef(false);
+  const [abortReason, setAbortReason] = useState<AbortedReason | null>(null);
 
-  // Fetch candidate info
-  useEffect(() => {
+  const loadCandidateInfo = useCallback(() => {
     if (!token) return;
+    fatalErrorRef.current = false;
+    interviewStateRef.current = "idle";
+    setInterviewState("idle");
+    setAbortReason(null);
     sessionsApi
       .getCandidateInfo(token)
       .then((res) => {
@@ -50,25 +57,37 @@ export default function InterviewPage() {
         setSessionId(res.data.session_id);
         if (res.data.session_status === "ended") setInterviewState("complete");
       })
-      .catch(() => setInterviewState("complete"));
+      .catch((err: AxiosError) => {
+        setAbortReason(err.response?.status === 404 ? "invalid_invite" : "load_failed");
+        setInterviewState("error");
+      });
   }, [token]);
+
+  useEffect(() => {
+    loadCandidateInfo();
+  }, [loadCandidateInfo]);
 
   const muteRef = useRef<(() => void) | null>(null);
   const unmuteRef = useRef<(() => void) | null>(null);
 
-  const handleStateChange = useCallback((state: InterviewState) => {
+  const handleFatalError = useCallback((_message: string) => {
+    fatalErrorRef.current = true;
+    setAbortReason("session_error");
+  }, []);
+
+  const handleStateChange = useCallback((rawState: InterviewState) => {
+    const state = rawState === "complete" && fatalErrorRef.current ? "error" : rawState;
+
     setInterviewState((prev) => {
-      // Once complete, never go back
-      if (prev === "complete") return prev;
-      
-      // We must handle side-effects carefully. Since we can't easily break out
-      // of the callback if prev === complete, we'll rely on a ref to track if we're complete.
+      // Once complete or aborted, never go back
+      if (prev === "complete" || prev === "error") return prev;
+
       return state;
     });
 
-    if (interviewStateRef.current === "complete") return;
-    if (state === "complete") {
-      interviewStateRef.current = "complete";
+    if (interviewStateRef.current === "complete" || interviewStateRef.current === "error") return;
+    if (state === "complete" || state === "error") {
+      interviewStateRef.current = state;
     }
 
     if (state === "draining_audio") {
@@ -164,6 +183,7 @@ export default function InterviewPage() {
     onStateChange: handleStateChange,
     onSpeakerChange: handleSpeakerChange,
     onReconnected: handleReconnected,
+    onFatalError: handleFatalError,
   });
 
   const {
@@ -219,6 +239,11 @@ export default function InterviewPage() {
       : connectionState === "connected"
         ? "connected"
         : "reconnecting";
+
+  // ── State: Aborted ──────────────────────────────────────────────────────
+  if (interviewState === "error") {
+    return <InterviewAborted reason={abortReason ?? "load_failed"} onRetry={loadCandidateInfo} />;
+  }
 
   // ── State A: Pre-start ──────────────────────────────────────────────────
   if (interviewState === "idle") {

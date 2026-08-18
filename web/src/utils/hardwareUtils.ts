@@ -47,21 +47,42 @@ export function getOSInfo() {
   return os;
 }
 
-export async function checkCamera(): Promise<MediaStream | null> {
+export type MediaAccessError = "permission_denied" | "not_found" | "not_readable" | "unknown";
+
+export interface MediaAccessResult {
+  stream: MediaStream | null;
+  error: MediaAccessError | null;
+}
+
+function classifyMediaError(err: unknown): MediaAccessError {
+  const name = err instanceof DOMException ? err.name : "";
+  if (name === "NotAllowedError" || name === "SecurityError") return "permission_denied";
+  if (name === "NotFoundError" || name === "OverconstrainedError") return "not_found";
+  if (name === "NotReadableError") return "not_readable";
+  return "unknown";
+}
+
+export async function requestUserMedia(
+  constraints: MediaStreamConstraints,
+): Promise<MediaAccessResult> {
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        width: { max: 640 },
-        height: { max: 480 },
-        frameRate: { max: 20 },
-        facingMode: "user",
-      },
-      audio: true,
-    });
-    return stream;
-  } catch {
-    return null;
+    const stream = await navigator.mediaDevices.getUserMedia(constraints);
+    return { stream, error: null };
+  } catch (err) {
+    return { stream: null, error: classifyMediaError(err) };
   }
+}
+
+export async function checkCamera(): Promise<MediaAccessResult> {
+  return requestUserMedia({
+    video: {
+      width: { max: 640 },
+      height: { max: 480 },
+      frameRate: { max: 20 },
+      facingMode: "user",
+    },
+    audio: true,
+  });
 }
 
 export function getCurrentTime(): string {

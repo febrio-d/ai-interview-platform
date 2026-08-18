@@ -17,6 +17,7 @@ interface UseAudioWebSocketOptions {
   onStateChange: (state: InterviewState) => void;
   onSpeakerChange: (speaker: InterviewSpeaker) => void;
   onReconnected?: () => void;
+  onFatalError?: (message: string) => void;
 }
 
 const RECONNECT_DELAYS = [1000, 2000, 4000];
@@ -29,6 +30,7 @@ export function useAudioWebSocket({
   onStateChange,
   onSpeakerChange,
   onReconnected,
+  onFatalError,
 }: UseAudioWebSocketOptions) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -136,6 +138,7 @@ export function useAudioWebSocket({
               if (!msg.recoverable) {
                 sessionEndedRef.current = true;
                 reconnectAttemptsRef.current = RECONNECT_DELAYS.length;
+                onFatalError?.(msg.message ?? "The interview encountered an error.");
                 onStateChange("complete");
                 clearAudioChunks(sessionId);
               }
@@ -165,7 +168,16 @@ export function useAudioWebSocket({
         onStateChange("complete");
       }
     };
-  }, [sessionId, token, onAudioChunk, onTranscript, onStateChange, onSpeakerChange, flushQueuedChunks]);
+  }, [
+    sessionId,
+    token,
+    onAudioChunk,
+    onTranscript,
+    onStateChange,
+    onSpeakerChange,
+    onFatalError,
+    flushQueuedChunks,
+  ]);
 
   const send = useCallback(
     (buffer: ArrayBuffer) => {

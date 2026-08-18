@@ -7,13 +7,16 @@ import {
 import {
   ProctoringState,
   type HardwareCheckingProgress,
+  type MediaAccessError,
   getBrowserInfo,
   getOSInfo,
   checkCamera,
+  requestUserMedia,
   getCurrentTime,
 } from "@/utils/hardwareUtils";
 import { Button } from "@/components/ui/button";
 import { RefreshCw, CheckCircle, XCircle, Loader2, Circle } from "lucide-react";
+import HardwarePermissionError from "@/components/interview/HardwarePermissionError";
 
 interface HardwareCheckProps {
   onStart?: () => void;
@@ -48,6 +51,7 @@ const HardwareCheck: React.FC<HardwareCheckProps> = ({ onStart }) => {
   const [internetResult, setInternetResult] = useState<InternetSpeedResult | null>(null);
   const [videoStream, setVideoStream] = useState<MediaStream | null>(null);
   const [audioLevel, setAudioLevel] = useState<number>(0);
+  const [mediaError, setMediaError] = useState<MediaAccessError | null>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
 
   useEffect(() => {
@@ -154,12 +158,11 @@ const HardwareCheck: React.FC<HardwareCheckProps> = ({ onStart }) => {
     const micLoading = !REQUIRE_CAMERA && progress.microphone === ProctoringState.LOADING;
     if (!cameraLoading && !micLoading) return;
 
-    const getStream = REQUIRE_CAMERA
-      ? checkCamera()
-      : navigator.mediaDevices.getUserMedia({ audio: true }).catch(() => null);
+    const getResult = REQUIRE_CAMERA ? checkCamera() : requestUserMedia({ audio: true });
 
-    getStream.then((stream) => {
+    getResult.then(({ stream, error }) => {
       if (stream) {
+        setMediaError(null);
         if (REQUIRE_CAMERA) setVideoStream(stream);
         startAudioLevelMonitoring(stream);
         setProgress((p) => ({
@@ -169,6 +172,7 @@ const HardwareCheck: React.FC<HardwareCheckProps> = ({ onStart }) => {
           audio: ProctoringState.LOADING,
         }));
       } else {
+        setMediaError(error);
         setProgress((p) => ({
           ...p,
           ...(REQUIRE_CAMERA ? { camera: ProctoringState.ERROR } : {}),
@@ -193,6 +197,7 @@ const HardwareCheck: React.FC<HardwareCheckProps> = ({ onStart }) => {
     videoStream?.getTracks().forEach((t) => t.stop());
     setVideoStream(null);
     setInternetResult(null);
+    setMediaError(null);
     setProgress({
       osAndBrowser: ProctoringState.LOADING,
       internet: ProctoringState.WAITING,
@@ -213,6 +218,10 @@ const HardwareCheck: React.FC<HardwareCheckProps> = ({ onStart }) => {
   ];
 
   const hasError = Object.values(progress).some((s) => s === ProctoringState.ERROR);
+
+  if (mediaError) {
+    return <HardwarePermissionError reason={mediaError} onRetry={retryAll} />;
+  }
 
   return (
     <div className="rounded-lg border bg-card overflow-hidden">
