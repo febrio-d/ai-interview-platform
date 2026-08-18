@@ -1,5 +1,6 @@
 import api from "./api";
-import type { Portfolio, AssessorOverride, FitGapReport } from "@/types";
+import type { AssessorOverride, FitGapReport, FitGapSnapshot } from "@/types";
+
 
 export const portfoliosApi = {
   getOverride: (
@@ -31,4 +32,7 @@ export const portfoliosApi = {
       params: { format, ...(vacancyId ? { vacancy_id: vacancyId } : {}) },
       responseType: format === "pdf" ? "blob" : "json",
     }),
+  
+  getFitGapHistory: (portfolioId: number) =>
+    api.get<{ history: FitGapSnapshot[] }>(`/portfolios/${portfolioId}/fitgap_history`),
 };

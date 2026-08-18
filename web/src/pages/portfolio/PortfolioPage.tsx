@@ -15,8 +15,17 @@ import { sessionsApi } from "@/services/sessions";
 import { vacanciesApi } from "@/services/vacancies";
 import { portfoliosApi } from "@/services/portfolios";
 import { usePolling } from "@/hooks/usePolling";
-import { ArrowLeft, Download, Loader2, RefreshCw, Zap, FileText } from "lucide-react";
-import type { Portfolio, AssessorOverride, Vacancy } from "@/types";
+import {
+  ArrowLeft,
+  Download,
+  Loader2,
+  RefreshCw,
+  Zap,
+  FileText,
+  Clock,
+  ChevronRight,
+} from "lucide-react";
+import type { Portfolio, AssessorOverride, Vacancy, FitGapSnapshot } from "@/types";
 
 export default function PortfolioPage() {
   const { id, sessionId } = useParams<{ id: string; sessionId: string }>();
@@ -29,6 +38,7 @@ export default function PortfolioPage() {
   const [selectedVacancy, setSelectedVacancy] = useState<string>("");
   const [exporting, setExporting] = useState<"pdf" | "json" | null>(null);
   const [candidateName, setCandidateName] = useState<string | null>(null);
+  const [history, setHistory] = useState<FitGapSnapshot[]>([]);
 
   const fetchPortfolio = useCallback(async () => {
     const res = await sessionsApi.getPortfolio(Number(sessionId));
@@ -42,12 +52,17 @@ export default function PortfolioPage() {
     } else if (data.portfolio) {
       setPortfolio(data.portfolio);
       setGenerating(false);
-      // Build overrides map
+
       const overrideMap: Record<number, AssessorOverride> = {};
       data.portfolio.overrides.forEach((o: AssessorOverride) => {
         overrideMap[o.portfolio_skill_id] = o;
       });
       setOverrides(overrideMap);
+
+      portfoliosApi
+        .getFitGapHistory(data.portfolio.id)
+        .then((historyRes) => setHistory(historyRes.data.history || []))
+        .catch(() => {});
     }
   }, [sessionId]);
 
@@ -61,7 +76,6 @@ export default function PortfolioPage() {
       .finally(() => setLoading(false));
   }, [fetchPortfolio, sessionId]);
 
-  // Poll while generating
   usePolling(fetchPortfolio, 5000, generating);
 
   const handleOverrideSaved = (skillId: number, override: AssessorOverride) => {
@@ -116,7 +130,6 @@ export default function PortfolioPage() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
-      {/* Header */}
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-2">
           <Link
@@ -172,7 +185,6 @@ export default function PortfolioPage() {
         </div>
       </div>
 
-      {/* Generating state */}
       {generating && (
         <div className="border rounded-lg p-12 text-center space-y-3">
           <Loader2 className="h-8 w-8 animate-spin text-primary mx-auto" />
@@ -185,7 +197,6 @@ export default function PortfolioPage() {
         </div>
       )}
 
-      {/* Failed state */}
       {!generating && portfolio?.generation_status === "failed" && (
         <div className="border border-destructive/40 rounded-lg p-6 text-center space-y-3">
           <p className="text-sm text-destructive">Portfolio generation failed.</p>
@@ -202,10 +213,8 @@ export default function PortfolioPage() {
         </div>
       )}
 
-      {/* Ready state */}
       {!generating && portfolio?.generation_status === "complete" && (
         <>
-          {/* Configured skills */}
           <div className="space-y-3">
             <h2 className="text-sm font-semibold">Configured Skills</h2>
             {portfolio.skills
@@ -220,7 +229,6 @@ export default function PortfolioPage() {
               ))}
           </div>
 
-          {/* Discovered skills */}
           {portfolio.skills.some((s) => s.is_discovered) && (
             <>
               <Separator />
@@ -250,23 +258,61 @@ export default function PortfolioPage() {
 
           <Separator />
 
-          {/* Fit/Gap */}
-          <div className="flex items-center gap-3">
-            <Select value={selectedVacancy} onValueChange={setSelectedVacancy}>
-              <SelectTrigger className="w-56">
-                <SelectValue placeholder="Choose vacancy..." />
-              </SelectTrigger>
-              <SelectContent>
-                {vacancies.map((v) => (
-                  <SelectItem key={v.id} value={String(v.id)}>
-                    {v.role_title}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <Button onClick={handleRunFitGap} disabled={!selectedVacancy}>
-              Run Fit/Gap Analysis →
-            </Button>
+          <div className="space-y-4">
+            <h2 className="text-sm font-semibold">Fit/Gap Analysis</h2>
+            <div className="flex items-center gap-3">
+              <Select value={selectedVacancy} onValueChange={setSelectedVacancy}>
+                <SelectTrigger className="w-56">
+                  <SelectValue placeholder="Choose vacancy..." />
+                </SelectTrigger>
+                <SelectContent>
+                  {vacancies.map((v) => (
+                    <SelectItem key={v.id} value={String(v.id)}>
+                      {v.role_title}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Button onClick={handleRunFitGap} disabled={!selectedVacancy}>
+                Run Fit/Gap Analysis →
+              </Button>
+            </div>
+
+            {history.length > 0 && (
+              <div className="mt-4 space-y-2">
+                <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
+                  Past Analyses
+                </p>
+                <div className="grid gap-2">
+                  {history.slice(0, 3).map((snapshot) => (
+                    <Link
+                      key={snapshot.id}
+                      to={`/assessments/${id}/sessions/${sessionId}/fitgap/${snapshot.vacancy_id}`}
+                      className="flex items-center justify-between p-3 rounded-lg border bg-white hover:bg-muted/50 transition-colors"
+                    >
+                      <div>
+                        <p className="text-sm font-medium">{snapshot.vacancy_title}</p>
+                        <p className="text-xs text-muted-foreground flex items-center gap-1 mt-0.5">
+                          <Clock className="h-3 w-3" />
+                          {new Date(snapshot.generated_at).toLocaleDateString("id-ID", {
+                            month: "short",
+                            day: "numeric",
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </p>
+                      </div>
+                      <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                    </Link>
+                  ))}
+                </div>
+                {history.length > 3 && (
+                  <p className="text-xs text-muted-foreground text-center pt-1">
+                    + {history.length - 3} older snapshots available inside the report.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
         </>
       )}
