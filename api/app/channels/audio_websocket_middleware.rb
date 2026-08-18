@@ -12,6 +12,7 @@ class AudioWebSocketMiddleware
   BROWSER_GRACE_PERIOD = 120 # seconds to keep Gemini alive after browser disconnects
   PROACTIVE_RECONNECT_AFTER = ENV.fetch('PROACTIVE_RECONNECT_AFTER', 510).to_i
   PROACTIVE_RECONNECT_JITTER = 30  # randomise to avoid thundering herd
+  AUTH_MESSAGE_TIMEOUT = 10 # seconds to wait for a post-open { type: "auth" } message
 
   SYSTEM_SIGNAL_TOKEN = 'SYS-TC-7x9k'
 
@@ -47,27 +48,66 @@ class AudioWebSocketMiddleware
   end
 
   def handle_browser_open(env, session_id, browser_ws, state)
-    session, error = authenticate_and_load(env, session_id)
+    auth_header = env['HTTP_AUTHORIZATION']
 
-    if error
-      browser_ws.send({ type: 'error', code: 'auth_failed', message: error, recoverable: false }.to_json)
-      browser_ws.close
+    if auth_header.present?
+      session, error = authenticate_by_header(auth_header, session_id)
+      return fail_auth(browser_ws, error) if error
+
+      start_session(browser_ws, session, state)
       return
     end
 
-    state.session = session
-    connect_to_gemini(browser_ws, state)
+    state.auth_timeout_timer = EM::Timer.new(AUTH_MESSAGE_TIMEOUT) do
+      next if state.session
+
+      Rails.logger.warn("[AudioWS] No auth message received within #{AUTH_MESSAGE_TIMEOUT}s (session=#{session_id})")
+      browser_ws.close
+    end
   rescue StandardError => e
     Rails.logger.error("[AudioWS] Exception in on:open: #{e.class}: #{e.message}\n#{e.backtrace.first(5).join("\n")}")
     browser_ws.close
   end
 
+  def start_session(browser_ws, session, state)
+    state.auth_timeout_timer&.cancel
+    state.session = session
+    connect_to_gemini(browser_ws, state)
+  rescue StandardError => e
+    Rails.logger.error("[AudioWS] Exception starting session: #{e.class}: #{e.message}\n#{e.backtrace.first(5).join("\n")}")
+    browser_ws.close
+  end
+
+  def fail_auth(browser_ws, error)
+    browser_ws.send({ type: 'error', code: 'auth_failed', message: error, recoverable: false }.to_json)
+    browser_ws.close
+  end
+
   def handle_browser_frame(event, browser_ws, state, session_id)
+    unless state.session
+      handle_pre_auth_message(event.data, browser_ws, state, session_id)
+      return
+    end
+
     if event.data.is_a?(String) && !event.data.start_with?('{')
       forward_audio_frame(event.data, state, session_id)
     else
       handle_browser_message(event.data, browser_ws, state)
     end
+  end
+
+  def handle_pre_auth_message(data, browser_ws, state, session_id)
+    return unless data.is_a?(String)
+
+    message = JSON.parse(data)
+    return unless message['type'] == 'auth'
+
+    session, error = authenticate_by_token(message['token'].to_s, session_id)
+    return fail_auth(browser_ws, error) if error
+
+    start_session(browser_ws, session, state)
+  rescue JSON::ParserError
+    nil
   end
 
   # Forward audio frame to Gemini when ready; suppress while model is speaking to prevent echo loop.
@@ -727,29 +767,28 @@ class AudioWebSocketMiddleware
     CLOSING_PHRASES_REGEX.match?(text)
   end
 
-  def authenticate_and_load(env, session_id)
-    request = Rack::Request.new(env)
+  def authenticate_by_header(auth_header, session_id)
+    token = auth_header.split(' ').last
+    payload = JsonWebToken.decode(token)
+    tenant_id = Organization.find_by(scheme: payload[:scheme])&.id
+    return [nil, 'Invalid tenant'] unless tenant_id
 
-    session = begin
-      invite_token = request.params['token']
+    session = Session.unscoped.where(tenant_id: tenant_id).find_by(id: session_id)
+    validate_session(session, session_id)
+  rescue StandardError => e
+    [nil, "Authentication failed: #{e.message}"]
+  end
 
-      if invite_token.present?
-        Session.unscoped.find_by(invite_token: invite_token)
-      else
-        auth_header = env['HTTP_AUTHORIZATION']
-        return [nil, 'Missing authorization'] unless auth_header.present?
+  def authenticate_by_token(invite_token, session_id)
+    return [nil, 'Missing token'] if invite_token.blank?
 
-        token = auth_header.split(' ').last
-        payload = JsonWebToken.decode(token)
-        tenant_id = Organization.find_by(scheme: payload[:scheme])&.id
-        return [nil, 'Invalid tenant'] unless tenant_id
+    session = Session.unscoped.find_by(invite_token: invite_token)
+    validate_session(session, session_id)
+  rescue StandardError => e
+    [nil, "Authentication failed: #{e.message}"]
+  end
 
-        Session.unscoped.where(tenant_id: tenant_id).find_by(id: session_id)
-      end
-    rescue StandardError => e
-      return [nil, "Authentication failed: #{e.message}"]
-    end
-
+  def validate_session(session, session_id)
     return [nil, 'Session not found'] unless session
     return [nil, 'Session has ended'] if session.ended?
     return [nil, 'Session ID mismatch'] if session.id.to_s != session_id
@@ -769,7 +808,7 @@ class AudioWebSocketMiddleware
   class ConnectionState
     attr_accessor :session, :gemini_client, :turn_counter,
                   :reconnect_attempts, :browser_disconnected_at,
-                  :proactive_reconnect_timer,
+                  :proactive_reconnect_timer, :auth_timeout_timer,
                   :latest_resumption_token,
                   :reconnecting, :last_token_persisted_at,
                   :ending_scheduled, :logged_not_ready,
