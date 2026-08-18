@@ -36,9 +36,7 @@ export function useAudioWebSocket({
 
     sessionEndedRef.current = false;
     setConnectionState("connecting");
-    const url = token
-      ? `${WS_URL}/ws/sessions/${sessionId}/audio?token=${token}`
-      : `${WS_URL}/ws/sessions/${sessionId}/audio`;
+    const url = `${WS_URL}/ws/sessions/${sessionId}/audio`;
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     wsRef.current = ws;
