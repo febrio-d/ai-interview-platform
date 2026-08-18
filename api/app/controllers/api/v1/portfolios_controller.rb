@@ -6,7 +6,7 @@ module Api
       authorize_auth_token! :assessor
 
       before_action :set_session,   only: %i[show regenerate]
-      before_action :set_portfolio, only: %i[show export]
+      before_action :set_portfolio, only: %i[show export fitgap_history]
 
       # GET /api/v1/sessions/:id/portfolio
       def show
@@ -123,6 +123,18 @@ module Api
         render json: { status: "generating", message: "Fit/gap report generation queued" }, status: :accepted
       rescue ActiveRecord::RecordNotFound
         json_error("Portfolio not found", :not_found)
+      end
+
+      # GET /api/v1/portfolios/:id/fitgap_history
+      def fitgap_history
+        reports = FitGapReport.where(portfolio_id: @portfolio.id).order(generated_at: :desc)
+        
+        render json: { 
+          history: reports.map { |r| fit_gap_json(r).merge(
+            vacancy_title: r.vacancy_title, 
+            trigger_reason: r.trigger_reason
+          )}
+        }
       end
 
       # GET /api/v1/portfolios/:id/fitgap/:vacancy_id
