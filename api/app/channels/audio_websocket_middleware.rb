@@ -51,10 +51,12 @@ class AudioWebSocketMiddleware
     auth_header = env['HTTP_AUTHORIZATION']
 
     if auth_header.present?
-      session, error = authenticate_by_header(auth_header, session_id)
-      return fail_auth(browser_ws, error) if error
+      ActiveRecord::Base.connection_pool.with_connection do
+        session, error = authenticate_by_header(auth_header, session_id)
+        next fail_auth(browser_ws, error) if error
 
-      start_session(browser_ws, session, state)
+        start_session(browser_ws, session, state)
+      end
       return
     end
 
@@ -102,10 +104,12 @@ class AudioWebSocketMiddleware
     message = JSON.parse(data)
     return unless message['type'] == 'auth'
 
-    session, error = authenticate_by_token(message['token'].to_s, session_id)
-    return fail_auth(browser_ws, error) if error
+    ActiveRecord::Base.connection_pool.with_connection do
+      session, error = authenticate_by_token(message['token'].to_s, session_id)
+      next fail_auth(browser_ws, error) if error
 
-    start_session(browser_ws, session, state)
+      start_session(browser_ws, session, state)
+    end
   rescue JSON::ParserError
     nil
   end
