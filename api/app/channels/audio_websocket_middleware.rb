@@ -183,21 +183,18 @@ class AudioWebSocketMiddleware
       maybe_inject_coverage(state, session)
       maybe_piggyback_wrap_up(state, session)
 
-      # Push DB writes off the EM thread so audio forwarding doesn't stall.
-      # Capture browser_disconnected_at before spawning so the thread can bail
-      # immediately if the browser already dropped — avoids the "stream closed in
-      # another thread" race when Gemini closes while we're still writing.
-      already_disconnected = state.browser_disconnected_at.present?
-      Thread.new do
-        next if already_disconnected
+      # Bail immediately if the browser already dropped — avoids racing writes
+      # for a turn nobody is listening for anymore.
+      unless state.browser_disconnected_at.present?
+        TranscriptTurnWriterWorker.perform_async(session.id, turn_number, 'candidate', text)
 
-        ActiveRecord::Base.connection_pool.with_connection do
-          save_transcript_turn(session, turn_number, 'candidate', text)
-          CoverageAnalyzerWorker.perform_async(session.id, turn_number)
-          refresh_coverage_cache(session, state)
+        Thread.new do
+          ActiveRecord::Base.connection_pool.with_connection do
+            refresh_coverage_cache(session, state)
+          end
+        rescue StandardError => e
+          Rails.logger.error("[AudioWS] Thread crashed (coverage refresh): #{e.class}: #{e.message}")
         end
-      rescue StandardError => e
-        Rails.logger.error("[AudioWS] Thread crashed (input transcription): #{e.class}: #{e.message}")
       end
 
       send_json(browser_ws, type: 'transcription', speaker: 'candidate',
@@ -240,16 +237,7 @@ class AudioWebSocketMiddleware
 
       turn_number = state.increment_turn!
 
-      already_disconnected = state.browser_disconnected_at.present?
-      Thread.new do
-        next if already_disconnected
-
-        ActiveRecord::Base.connection_pool.with_connection do
-          save_transcript_turn(session, turn_number, 'ai', text)
-        end
-      rescue StandardError => e
-        Rails.logger.error("[AudioWS] Thread crashed (output transcription): #{e.class}: #{e.message}")
-      end
+      TranscriptTurnWriterWorker.perform_async(session.id, turn_number, 'ai', text) unless state.browser_disconnected_at.present?
 
       send_json(browser_ws, type: 'transcription', speaker: 'ai',
                             text: text, turn_number: turn_number)
@@ -324,16 +312,7 @@ class AudioWebSocketMiddleware
       next if state.last_token_persisted_at && (now - state.last_token_persisted_at) < 60
 
       state.last_token_persisted_at = now
-      already_disconnected = state.browser_disconnected_at.present?
-      Thread.new do
-        next if already_disconnected
-
-        ActiveRecord::Base.connection_pool.with_connection do
-          session.update_column(:gemini_resumption_token, token)
-        end
-      rescue StandardError => e
-        Rails.logger.error("[AudioWS] Thread crashed (resumption token): #{e.class}: #{e.message}")
-      end
+      ResumptionTokenWriterWorker.perform_async(session.id, token) unless state.browser_disconnected_at.present?
     }
   end
 
@@ -679,18 +658,6 @@ class AudioWebSocketMiddleware
     Rails.logger.debug("[AudioWS] Coverage cache refreshed in #{elapsed}ms")
   rescue StandardError => e
     Rails.logger.error("[AudioWS] Coverage cache refresh failed: #{e.message}")
-  end
-
-  def save_transcript_turn(session, turn_number, speaker, text)
-    session.transcript_turns.create!(
-      turn_number: turn_number,
-      speaker: speaker,
-      text: text
-    )
-  rescue ActiveRecord::RecordNotUnique
-    # Duplicate turn — skip silently (idempotent)
-  rescue StandardError => e
-    Rails.logger.error("[AudioWS] Failed to save transcript turn: #{e.message}")
   end
 
   def check_time_ceiling(session, state, browser_ws)
